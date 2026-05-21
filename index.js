@@ -24,7 +24,7 @@ const packages = new Map();
 // ---------------------------------------------------------------------------
 // Active sessions — keyed by sessionId
 // ---------------------------------------------------------------------------
-const sessions = new Map(); // sessionId -> { transport, server }
+const sessions = new Map();
 
 // ---------------------------------------------------------------------------
 // Factory: create a fresh McpServer with all tools registered
@@ -66,18 +66,16 @@ function createMcpServer() {
     async ({ query }) => {
       console.log(`✅ get_scope_package called: ${query}`);
       const q = query.toLowerCase();
-      let pkg = q.startsWith('pkg_')
+      const pkg = q.startsWith('pkg_')
         ? packages.get(q)
         : Array.from(packages.values()).find(
             (p) =>
               p.client_name.toLowerCase().includes(q) ||
               (p.job_id && p.job_id.toLowerCase().includes(q))
           );
-
       if (!pkg) {
         return { content: [{ type: 'text', text: `No package found matching "${query}"` }] };
       }
-
       return {
         content: [{
           type: 'text',
@@ -165,13 +163,11 @@ app.post('/packages', (req, res) => {
     console.log('❌ Unauthorized package ingest attempt');
     return res.status(401).json({ error: 'Unauthorized' });
   }
-
   const scopeData = req.body;
   if (!scopeData.jobInfo || !scopeData.jobInfo.clientName) {
     console.log('❌ Invalid scope data received');
     return res.status(400).json({ error: 'Invalid scope data: missing jobInfo.clientName' });
   }
-
   const packageId = 'pkg_' + crypto.randomBytes(8).toString('hex');
   packages.set(packageId, {
     id: packageId,
@@ -184,7 +180,6 @@ app.post('/packages', (req, res) => {
     scope_data: scopeData,
     status: 'ready',
   });
-
   console.log(`📦 Package created: ${packageId} for ${scopeData.jobInfo.clientName}`);
   res.status(201).json({
     success: true,
@@ -195,10 +190,8 @@ app.post('/packages', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// MCP endpoint — Streamable HTTP (POST to init, GET for SSE stream, DELETE to close)
-// ---------------------------------------------------------------------------
-
 // POST /mcp — initialize new session or handle message on existing session
+// ---------------------------------------------------------------------------
 app.post('/mcp', async (req, res) => {
   console.log('🔵 MCP POST from:', req.headers['user-agent']);
   const sessionId = req.headers['mcp-session-id'];
@@ -212,43 +205,47 @@ app.post('/mcp', async (req, res) => {
   }
 
   // New session
-  if (!sessionId) {
-    console.log('🆕 New MCP session initializing...');
+  console.log('🆕 New MCP session initializing...');
 
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => crypto.randomUUID(),
-      onsessioninitialized: (id) => {
-        sessions.set(id, { transport, server });
-        console.log(`✅ Session initialized: ${id}`);
-      },
-    });
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => crypto.randomUUID(),
+  });
 
-    const server = createMcpServer();
+  const server = createMcpServer();
 
-    transport.onclose = () => {
-      if (transport.sessionId) {
-        sessions.delete(transport.sessionId);
-        console.log(`🔴 Session closed: ${transport.sessionId}`);
-      }
-    };
+  transport.onclose = () => {
+    const id = transport.sessionId;
+    if (id) {
+      sessions.delete(id);
+      console.log(`🔴 Session closed: ${id}`);
+    }
+  };
 
-    await server.connect(transport);
-    await transport.handleRequest(req, res);
-    return;
+  await server.connect(transport);
+
+  // Session ID is available after connect
+  const newSessionId = transport.sessionId;
+  if (newSessionId) {
+    sessions.set(newSessionId, { transport, server });
+    console.log(`✅ Session initialized: ${newSessionId}`);
+    res.setHeader('Mcp-Session-Id', newSessionId);
+  } else {
+    console.error('❌ Session ID not available after connect');
   }
 
-  console.warn(`⚠️  POST with unknown sessionId: ${sessionId}`);
-  res.status(404).json({ error: 'Session not found' });
+  await transport.handleRequest(req, res);
 });
 
+// ---------------------------------------------------------------------------
 // GET /mcp — open SSE stream for an existing session
+// ---------------------------------------------------------------------------
 app.get('/mcp', async (req, res) => {
   console.log('🔵 MCP GET from:', req.headers['user-agent']);
   const sessionId = req.headers['mcp-session-id'];
 
   if (!sessionId || !sessions.has(sessionId)) {
     console.warn(`⚠️  GET with unknown sessionId: ${sessionId}`);
-    return res.status(404).json({ error: 'Session not found' });
+    return res.status(404).json({ error: 'Session not found. Send POST to /mcp first.' });
   }
 
   console.log(`📡 Opening SSE stream for session: ${sessionId}`);
@@ -256,7 +253,9 @@ app.get('/mcp', async (req, res) => {
   await transport.handleRequest(req, res);
 });
 
+// ---------------------------------------------------------------------------
 // DELETE /mcp — close a session
+// ---------------------------------------------------------------------------
 app.delete('/mcp', async (req, res) => {
   console.log('🔵 MCP DELETE from:', req.headers['user-agent']);
   const sessionId = req.headers['mcp-session-id'];
