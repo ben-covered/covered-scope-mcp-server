@@ -298,7 +298,7 @@ app.get('/sse', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('X-Accel-Buffering', 'no');
 
-  const transport = new SSEServerTransport('/messages', res);
+  const transport = new SSEServerTransport(`${BASE_URL}/messages`, res);
 
   // Store transport so the /messages handler can route to it
   transports.set(transport.sessionId, transport);
