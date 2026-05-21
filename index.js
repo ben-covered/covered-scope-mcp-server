@@ -320,6 +320,10 @@ app.get('/sse', async (req, res) => {
 app.post('/messages', async (req, res) => {
   const sessionId = req.query.sessionId;
 
+  // DEBUG: log the raw incoming message body
+  console.log(`📨 Raw message body:`, JSON.stringify(req.body));
+  console.log(`📨 SessionId from query:`, sessionId);
+
   if (!sessionId) {
     console.error('❌ POST /messages called without sessionId');
     return res.status(400).json({ error: 'Missing sessionId query parameter' });
@@ -336,8 +340,9 @@ app.post('/messages', async (req, res) => {
 
   try {
     await transport.handlePostMessage(req, res);
+    console.log(`✅ handlePostMessage completed for session: ${sessionId}`);
   } catch (error) {
-    console.error(`❌ Error handling message for session ${sessionId}:`, error);
+    console.error(`❌ handlePostMessage error for session ${sessionId}:`, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
