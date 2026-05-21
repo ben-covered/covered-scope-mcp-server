@@ -3,6 +3,7 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  InitializeRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import express from 'express';
 import cors from 'cors';
@@ -19,18 +20,30 @@ if (!INGEST_SECRET) {
   process.exit(1);
 }
 
-// ---------------------------------------------------------------------------
 // In-memory package store
-// ---------------------------------------------------------------------------
 const packages = new Map();
 
-// ---------------------------------------------------------------------------
-// MCP Server — created ONCE at module level, not per-connection
-// ---------------------------------------------------------------------------
+// MCP Server
 const server = new Server(
   { name: 'covered-scope-mcp', version: '1.0.0' },
   { capabilities: { tools: {} } }
 );
+
+// Handle Initialize request explicitly
+server.setRequestHandler(InitializeRequestSchema, async (request) => {
+  console.log('✅ Initialize request received');
+  console.log(`   Client: ${request.params.clientInfo?.name || 'unknown'}`);
+  return {
+    protocolVersion: '2024-11-05',
+    capabilities: {
+      tools: {},
+    },
+    serverInfo: {
+      name: 'covered-scope-mcp',
+      version: '1.0.0',
+    },
+  };
+});
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   console.log('✅ ListTools request received');
@@ -192,14 +205,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Active SSE transports — keyed by sessionId so /messages can route to them
-// ---------------------------------------------------------------------------
+// Active SSE transports
 const transports = new Map();
 
-// ---------------------------------------------------------------------------
 // Express app
-// ---------------------------------------------------------------------------
 const app = express();
 
 app.use(
@@ -213,7 +222,6 @@ app.use(
 
 app.use(express.json({ limit: '10mb' }));
 
-// OAuth discovery endpoints (authless — required by some MCP clients)
 app.get('/.well-known/oauth-protected-resource', (req, res) => {
   res.json({
     resource: BASE_URL,
@@ -248,9 +256,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Package ingest endpoint (called by your external system)
-// ---------------------------------------------------------------------------
 app.post('/packages', (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || authHeader !== `Bearer ${INGEST_SECRET}`) {
@@ -286,9 +291,6 @@ app.post('/packages', (req, res) => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// MCP SSE endpoint — Claude connects here first
-// ---------------------------------------------------------------------------
 app.get('/sse', async (req, res) => {
   console.log('🔵 MCP SSE connection from:', req.headers['user-agent']);
 
@@ -300,7 +302,6 @@ app.get('/sse', async (req, res) => {
 
   const transport = new SSEServerTransport(`${BASE_URL}/messages`, res);
 
-  // Store transport so the /messages handler can route to it
   transports.set(transport.sessionId, transport);
   console.log(`🔗 SSE session opened: ${transport.sessionId}`);
 
@@ -309,14 +310,15 @@ app.get('/sse', async (req, res) => {
     console.log(`🔴 SSE session closed: ${transport.sessionId}`);
   });
 
-  // Connect the shared server instance to this transport
-  await server.connect(transport);
-  console.log(`✅ MCP connection established: ${transport.sessionId}`);
+  try {
+    await server.connect(transport);
+    console.log(`✅ MCP connection established: ${transport.sessionId}`);
+  } catch (error) {
+    console.error(`❌ Error connecting server to transport: ${error.message}`);
+    console.error(error.stack);
+  }
 });
 
-// ---------------------------------------------------------------------------
-// MCP messages endpoint — Claude POSTs all JSON-RPC requests here
-// ---------------------------------------------------------------------------
 app.post('/messages', async (req, res) => {
   const sessionId = req.query.sessionId;
 
@@ -337,14 +339,12 @@ app.post('/messages', async (req, res) => {
   try {
     await transport.handlePostMessage(req, res);
   } catch (error) {
-    console.error(`❌ Error handling message for session ${sessionId}:`, error);
+    console.error(`❌ Error handling message for session ${sessionId}:`, error.message);
+    console.error(error.stack);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// ---------------------------------------------------------------------------
-// Start
-// ---------------------------------------------------------------------------
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(60));
   console.log('🚀 Covered Scope MCP Server READY');
