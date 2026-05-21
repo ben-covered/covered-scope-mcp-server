@@ -16,19 +16,13 @@ if (!INGEST_SECRET) {
   process.exit(1);
 }
 
-// ---------------------------------------------------------------------------
-// In-memory package store — shared across all connections
-// ---------------------------------------------------------------------------
+// In-memory package store
 const packages = new Map();
 
-// ---------------------------------------------------------------------------
-// Active transports — keyed by sessionId
-// ---------------------------------------------------------------------------
+// Active transports keyed by sessionId
 const transports = new Map();
 
-// ---------------------------------------------------------------------------
 // Express app
-// ---------------------------------------------------------------------------
 const app = express();
 
 app.use(
@@ -43,9 +37,6 @@ app.use(
 
 app.use(express.json({ limit: '10mb' }));
 
-// ---------------------------------------------------------------------------
-// Health endpoint
-// ---------------------------------------------------------------------------
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -57,9 +48,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Package ingest endpoint (called by your external system)
-// ---------------------------------------------------------------------------
 app.post('/packages', (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || authHeader !== `Bearer ${INGEST_SECRET}`) {
@@ -95,9 +83,7 @@ app.post('/packages', (req, res) => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// MCP endpoint — Streamable HTTP transport (handles GET, POST, DELETE)
-// ---------------------------------------------------------------------------
+// MCP endpoint — Streamable HTTP transport
 app.all('/mcp', async (req, res) => {
   console.log(`🔵 MCP ${req.method} from:`, req.headers['user-agent']);
 
@@ -112,24 +98,13 @@ app.all('/mcp', async (req, res) => {
       return;
     }
 
-    // New session — only POST can initialize
+    // New session — POST initializes
     if (req.method === 'POST' && !sessionId) {
       console.log('🆕 New MCP session initializing...');
 
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => crypto.randomUUID(),
-        onsessioninitialized: (id) => {
-          transports.set(id, transport);
-          console.log(`✅ Session initialized: ${id}`);
-        },
       });
-
-      transport.onclose = () => {
-        if (transport.sessionId) {
-          transports.delete(transport.sessionId);
-          console.log(`🔴 Session closed: ${transport.sessionId}`);
-        }
-      };
 
       // Create a fresh McpServer for this session
       const server = new McpServer(
@@ -252,7 +227,14 @@ app.all('/mcp', async (req, res) => {
         }
       );
 
+      // Connect server to transport
       await server.connect(transport);
+
+      // Store transport for future requests
+      transports.set(transport.sessionId, transport);
+      console.log(`✅ Session initialized: ${transport.sessionId}`);
+
+      // Handle the initial request
       await transport.handleRequest(req, res);
       return;
     }
@@ -262,16 +244,14 @@ app.all('/mcp', async (req, res) => {
     res.status(400).json({ error: 'Bad request' });
 
   } catch (error) {
-    console.error('❌ MCP handler error:', error);
+    console.error('❌ MCP handler error:', error.message);
+    console.error(error.stack);
     if (!res.headersSent) {
       res.status(500).json({ error: 'Internal server error' });
     }
   }
 });
 
-// ---------------------------------------------------------------------------
-// Start
-// ---------------------------------------------------------------------------
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(60));
   console.log('🚀 Covered Scope MCP Server READY');
