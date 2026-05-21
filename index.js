@@ -17,48 +17,147 @@ if (!INGEST_SECRET) {
 }
 
 // ---------------------------------------------------------------------------
-// In-memory package store — shared across all connections
+// In-memory package store
 // ---------------------------------------------------------------------------
 const packages = new Map();
 
 // ---------------------------------------------------------------------------
-// Active transports — keyed by sessionId
+// Active sessions — keyed by sessionId
 // ---------------------------------------------------------------------------
-const transports = new Map();
+const sessions = new Map(); // sessionId -> { transport, server }
+
+// ---------------------------------------------------------------------------
+// Factory: create a fresh McpServer with all tools registered
+// ---------------------------------------------------------------------------
+function createMcpServer() {
+  const server = new McpServer(
+    { name: 'covered-scope-mcp', version: '1.0.0' },
+    { capabilities: { tools: {} } }
+  );
+
+  server.tool(
+    'list_scope_packages',
+    'Lists all available scope packages ready for estimate generation',
+    { limit: z.number().optional().describe('Maximum number of packages to return') },
+    async ({ limit = 20 }) => {
+      console.log('✅ list_scope_packages called');
+      const packageList = Array.from(packages.values())
+        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+        .slice(0, limit)
+        .map((pkg) => ({
+          package_id: pkg.id,
+          client_name: pkg.client_name,
+          address: pkg.address,
+          damage_type: pkg.damage_type,
+          date_of_loss: pkg.date_of_loss,
+          job_id: pkg.job_id,
+          created_at: pkg.created_at,
+          status: pkg.status,
+        }));
+      console.log(`   📋 Returning ${packageList.length} packages`);
+      return { content: [{ type: 'text', text: JSON.stringify(packageList, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    'get_scope_package',
+    'Retrieves the full scope JSON for a package by ID, client name, or job ID',
+    { query: z.string().describe('Package ID, client name, or job ID to search for') },
+    async ({ query }) => {
+      console.log(`✅ get_scope_package called: ${query}`);
+      const q = query.toLowerCase();
+      let pkg = q.startsWith('pkg_')
+        ? packages.get(q)
+        : Array.from(packages.values()).find(
+            (p) =>
+              p.client_name.toLowerCase().includes(q) ||
+              (p.job_id && p.job_id.toLowerCase().includes(q))
+          );
+
+      if (!pkg) {
+        return { content: [{ type: 'text', text: `No package found matching "${query}"` }] };
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            package_metadata: {
+              package_id: pkg.id,
+              client_name: pkg.client_name,
+              damage_type: pkg.damage_type,
+              created_at: pkg.created_at,
+            },
+            scope_data: pkg.scope_data,
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  server.tool(
+    'get_latest_scope',
+    'Retrieves the most recently created scope package',
+    {},
+    async () => {
+      console.log('✅ get_latest_scope called');
+      if (packages.size === 0) {
+        return { content: [{ type: 'text', text: 'No scope packages available' }] };
+      }
+      const latestPkg = Array.from(packages.values()).sort(
+        (a, b) => new Date(b.created_at) - new Date(a.created_at)
+      )[0];
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            package_metadata: {
+              package_id: latestPkg.id,
+              client_name: latestPkg.client_name,
+              damage_type: latestPkg.damage_type,
+              created_at: latestPkg.created_at,
+            },
+            scope_data: latestPkg.scope_data,
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  return server;
+}
 
 // ---------------------------------------------------------------------------
 // Express app
 // ---------------------------------------------------------------------------
 const app = express();
 
-app.use(
-  cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Mcp-Session-Id'],
-    exposedHeaders: ['Mcp-Session-Id'],
-    credentials: true,
-  })
-);
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Mcp-Session-Id'],
+  exposedHeaders: ['Mcp-Session-Id'],
+  credentials: true,
+}));
 
 app.use(express.json({ limit: '10mb' }));
 
 // ---------------------------------------------------------------------------
-// Health endpoint
+// Health
 // ---------------------------------------------------------------------------
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'covered-scope-mcp',
     packages_count: packages.size,
-    active_sessions: transports.size,
+    active_sessions: sessions.size,
     authentication: 'none',
     base_url: BASE_URL,
   });
 });
 
 // ---------------------------------------------------------------------------
-// Package ingest endpoint (called by your external system)
+// Package ingest
 // ---------------------------------------------------------------------------
 app.post('/packages', (req, res) => {
   const authHeader = req.headers.authorization;
@@ -96,177 +195,80 @@ app.post('/packages', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// MCP endpoint — Streamable HTTP transport (handles GET, POST, DELETE)
+// MCP endpoint — Streamable HTTP (POST to init, GET for SSE stream, DELETE to close)
 // ---------------------------------------------------------------------------
-app.all('/mcp', async (req, res) => {
-  console.log(`🔵 MCP ${req.method} from:`, req.headers['user-agent']);
 
-  try {
-    const sessionId = req.headers['mcp-session-id'];
+// POST /mcp — initialize new session or handle message on existing session
+app.post('/mcp', async (req, res) => {
+  console.log('🔵 MCP POST from:', req.headers['user-agent']);
+  const sessionId = req.headers['mcp-session-id'];
 
-    // Resume existing session
-    if (sessionId && transports.has(sessionId)) {
-      console.log(`🔗 Resuming session: ${sessionId}`);
-      const transport = transports.get(sessionId);
-      await transport.handleRequest(req, res);
-      return;
-    }
-
-    // New session — only POST can initialize
-    if (req.method === 'POST' && !sessionId) {
-      console.log('🆕 New MCP session initializing...');
-
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => crypto.randomUUID(),
-        onsessioninitialized: (id) => {
-          transports.set(id, transport);
-          console.log(`✅ Session initialized: ${id}`);
-        },
-      });
-
-      transport.onclose = () => {
-        if (transport.sessionId) {
-          transports.delete(transport.sessionId);
-          console.log(`🔴 Session closed: ${transport.sessionId}`);
-        }
-      };
-
-      // Create a fresh McpServer for this session
-      const server = new McpServer(
-        { name: 'covered-scope-mcp', version: '1.0.0' },
-        { capabilities: { tools: {} } }
-      );
-
-      // Register tools
-      server.tool(
-        'list_scope_packages',
-        'Lists all available scope packages ready for estimate generation',
-        { limit: z.number().optional().describe('Maximum number of packages to return') },
-        async ({ limit = 20 }) => {
-          console.log('✅ list_scope_packages called');
-          const packageList = Array.from(packages.values())
-            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-            .slice(0, limit)
-            .map((pkg) => ({
-              package_id: pkg.id,
-              client_name: pkg.client_name,
-              address: pkg.address,
-              damage_type: pkg.damage_type,
-              date_of_loss: pkg.date_of_loss,
-              job_id: pkg.job_id,
-              created_at: pkg.created_at,
-              status: pkg.status,
-            }));
-
-          console.log(`   📋 Returning ${packageList.length} packages`);
-          return {
-            content: [{ type: 'text', text: JSON.stringify(packageList, null, 2) }],
-          };
-        }
-      );
-
-      server.tool(
-        'get_scope_package',
-        'Retrieves the full scope JSON for a package by ID, client name, or job ID',
-        { query: z.string().describe('Package ID, client name, or job ID to search for') },
-        async ({ query }) => {
-          console.log(`✅ get_scope_package called: ${query}`);
-          const q = query.toLowerCase();
-          let pkg = null;
-
-          if (q.startsWith('pkg_')) {
-            pkg = packages.get(q);
-          } else {
-            pkg = Array.from(packages.values()).find(
-              (p) =>
-                p.client_name.toLowerCase().includes(q) ||
-                (p.job_id && p.job_id.toLowerCase().includes(q))
-            );
-          }
-
-          if (!pkg) {
-            return {
-              content: [{ type: 'text', text: `No package found matching "${query}"` }],
-            };
-          }
-
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify(
-                  {
-                    package_metadata: {
-                      package_id: pkg.id,
-                      client_name: pkg.client_name,
-                      damage_type: pkg.damage_type,
-                      created_at: pkg.created_at,
-                    },
-                    scope_data: pkg.scope_data,
-                  },
-                  null,
-                  2
-                ),
-              },
-            ],
-          };
-        }
-      );
-
-      server.tool(
-        'get_latest_scope',
-        'Retrieves the most recently created scope package',
-        {},
-        async () => {
-          console.log('✅ get_latest_scope called');
-          if (packages.size === 0) {
-            return {
-              content: [{ type: 'text', text: 'No scope packages available' }],
-            };
-          }
-
-          const latestPkg = Array.from(packages.values()).sort(
-            (a, b) => new Date(b.created_at) - new Date(a.created_at)
-          )[0];
-
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify(
-                  {
-                    package_metadata: {
-                      package_id: latestPkg.id,
-                      client_name: latestPkg.client_name,
-                      damage_type: latestPkg.damage_type,
-                      created_at: latestPkg.created_at,
-                    },
-                    scope_data: latestPkg.scope_data,
-                  },
-                  null,
-                  2
-                ),
-              },
-            ],
-          };
-        }
-      );
-
-      await server.connect(transport);
-      await transport.handleRequest(req, res);
-      return;
-    }
-
-    // Unrecognized request
-    console.warn(`⚠️  Unhandled MCP request: ${req.method}, sessionId: ${sessionId}`);
-    res.status(400).json({ error: 'Bad request' });
-
-  } catch (error) {
-    console.error('❌ MCP handler error:', error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Internal server error' });
-    }
+  // Resume existing session
+  if (sessionId && sessions.has(sessionId)) {
+    console.log(`📨 Message on existing session: ${sessionId}`);
+    const { transport } = sessions.get(sessionId);
+    await transport.handleRequest(req, res);
+    return;
   }
+
+  // New session
+  if (!sessionId) {
+    console.log('🆕 New MCP session initializing...');
+
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => crypto.randomUUID(),
+      onsessioninitialized: (id) => {
+        sessions.set(id, { transport, server });
+        console.log(`✅ Session initialized: ${id}`);
+      },
+    });
+
+    const server = createMcpServer();
+
+    transport.onclose = () => {
+      if (transport.sessionId) {
+        sessions.delete(transport.sessionId);
+        console.log(`🔴 Session closed: ${transport.sessionId}`);
+      }
+    };
+
+    await server.connect(transport);
+    await transport.handleRequest(req, res);
+    return;
+  }
+
+  console.warn(`⚠️  POST with unknown sessionId: ${sessionId}`);
+  res.status(404).json({ error: 'Session not found' });
+});
+
+// GET /mcp — open SSE stream for an existing session
+app.get('/mcp', async (req, res) => {
+  console.log('🔵 MCP GET from:', req.headers['user-agent']);
+  const sessionId = req.headers['mcp-session-id'];
+
+  if (!sessionId || !sessions.has(sessionId)) {
+    console.warn(`⚠️  GET with unknown sessionId: ${sessionId}`);
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  console.log(`📡 Opening SSE stream for session: ${sessionId}`);
+  const { transport } = sessions.get(sessionId);
+  await transport.handleRequest(req, res);
+});
+
+// DELETE /mcp — close a session
+app.delete('/mcp', async (req, res) => {
+  console.log('🔵 MCP DELETE from:', req.headers['user-agent']);
+  const sessionId = req.headers['mcp-session-id'];
+
+  if (!sessionId || !sessions.has(sessionId)) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  const { transport } = sessions.get(sessionId);
+  await transport.handleRequest(req, res);
+  sessions.delete(sessionId);
+  console.log(`🗑️  Session deleted: ${sessionId}`);
 });
 
 // ---------------------------------------------------------------------------
