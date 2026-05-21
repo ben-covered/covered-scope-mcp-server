@@ -39,9 +39,7 @@ app.get('/.well-known/oauth-protected-resource', (req, res) => {
     authorization_servers: [],
     bearer_methods_supported: ["header"],
     resource_documentation: `${BASE_URL}/health`,
-    // Explicitly declare no authentication required
     scopes_supported: [],
-    // Signal that this is an authless resource
     grant_types_supported: ["none"]
   });
 });
@@ -50,10 +48,8 @@ app.get('/.well-known/oauth-protected-resource', (req, res) => {
 app.get('/.well-known/oauth-authorization-server', (req, res) => {
   res.json({
     issuer: BASE_URL,
-    // Empty authorization endpoint signals authless
     authorization_endpoint: "",
     token_endpoint: "",
-    // Explicitly support "none" grant type
     grant_types_supported: ["none"],
     response_types_supported: [],
     scopes_supported: [],
@@ -69,6 +65,36 @@ app.get('/health', (req, res) => {
     packages_count: packages.size,
     authentication: 'none',
     base_url: BASE_URL
+  });
+});
+
+// MCP Manifest endpoint
+app.get('/mcp/manifest', (req, res) => {
+  res.json({
+    name: "covered-scope-mcp",
+    version: "1.0.0",
+    description: "Covered Scope MCP server for restoration estimate generation",
+    capabilities: {
+      tools: {}
+    },
+    authentication: {
+      type: "none"
+    }
+  });
+});
+
+// Root manifest endpoint (alternative)
+app.get('/manifest', (req, res) => {
+  res.json({
+    name: "covered-scope-mcp",
+    version: "1.0.0",
+    description: "Covered Scope MCP server for restoration estimate generation",
+    capabilities: {
+      tools: {}
+    },
+    authentication: {
+      type: "none"
+    }
   });
 });
 
@@ -328,6 +354,7 @@ app.listen(PORT, () => {
   console.log(`Covered Scope MCP server running on port ${PORT}`);
   console.log(`Base URL: ${BASE_URL}`);
   console.log(`Health: ${BASE_URL}/health`);
+  console.log(`Manifest: ${BASE_URL}/manifest`);
   console.log(`OAuth metadata: ${BASE_URL}/.well-known/oauth-protected-resource`);
   console.log(`Ingest: POST ${BASE_URL}/packages`);
   console.log(`MCP SSE: ${BASE_URL}/sse`);
