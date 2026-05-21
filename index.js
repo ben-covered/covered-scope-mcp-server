@@ -200,7 +200,9 @@ app.post('/mcp', async (req, res) => {
   // Resume existing session
   if (sessionId && transports[sessionId]) {
     console.log(`📨 Message on existing session: ${sessionId}`);
+    console.log(`   Method: ${req.body?.method || 'unknown'} | Params: ${JSON.stringify(req.body?.params || {}).slice(0, 200)}`);
     await transports[sessionId].handleRequest(req, res, req.body);
+    console.log(`   ✅ handleRequest completed for method: ${req.body?.method}`);
     return;
   }
 
