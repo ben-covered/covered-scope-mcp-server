@@ -1,5 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
@@ -22,9 +23,9 @@ if (!INGEST_SECRET) {
 const packages = new Map();
 
 // ---------------------------------------------------------------------------
-// Active sessions — keyed by sessionId
+// Active transports — keyed by sessionId
 // ---------------------------------------------------------------------------
-const sessions = new Map();
+const transports = {};
 
 // ---------------------------------------------------------------------------
 // Factory: create a fresh McpServer with all tools registered
@@ -148,7 +149,7 @@ app.get('/health', (req, res) => {
     status: 'ok',
     service: 'covered-scope-mcp',
     packages_count: packages.size,
-    active_sessions: sessions.size,
+    active_sessions: Object.keys(transports).length,
     authentication: 'none',
     base_url: BASE_URL,
   });
@@ -190,18 +191,27 @@ app.post('/packages', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /mcp — initialize new session or handle message on existing session
+// POST /mcp — client-to-server messages
 // ---------------------------------------------------------------------------
 app.post('/mcp', async (req, res) => {
   console.log('🔵 MCP POST from:', req.headers['user-agent']);
   const sessionId = req.headers['mcp-session-id'];
 
   // Resume existing session
-  if (sessionId && sessions.has(sessionId)) {
+  if (sessionId && transports[sessionId]) {
     console.log(`📨 Message on existing session: ${sessionId}`);
-    const { transport } = sessions.get(sessionId);
-    await transport.handleRequest(req, res);
+    await transports[sessionId].handleRequest(req, res, req.body);
     return;
+  }
+
+  // Only allow new sessions on initialize requests
+  if (!isInitializeRequest(req.body)) {
+    console.warn('⚠️  Non-initialize request with no valid session');
+    return res.status(400).json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'No valid session. Send initialize request first.' },
+      id: null,
+    });
   }
 
   // New session
@@ -209,64 +219,55 @@ app.post('/mcp', async (req, res) => {
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => crypto.randomUUID(),
+    onsessioninitialized: (newSessionId) => {
+      transports[newSessionId] = transport;
+      console.log(`✅ Session initialized: ${newSessionId}`);
+    },
   });
 
-  const server = createMcpServer();
-
   transport.onclose = () => {
-    const id = transport.sessionId;
-    if (id) {
-      sessions.delete(id);
-      console.log(`🔴 Session closed: ${id}`);
+    if (transport.sessionId) {
+      delete transports[transport.sessionId];
+      console.log(`🔴 Session closed: ${transport.sessionId}`);
     }
   };
 
+  const server = createMcpServer();
   await server.connect(transport);
 
-  // Session ID is available after connect
-  const newSessionId = transport.sessionId;
-  if (newSessionId) {
-    sessions.set(newSessionId, { transport, server });
-    console.log(`✅ Session initialized: ${newSessionId}`);
-    res.setHeader('Mcp-Session-Id', newSessionId);
-  } else {
-    console.error('❌ Session ID not available after connect');
-  }
-
-  await transport.handleRequest(req, res);
+  // handleRequest fires onsessioninitialized internally
+  await transport.handleRequest(req, res, req.body);
 });
 
 // ---------------------------------------------------------------------------
-// GET /mcp — open SSE stream for an existing session
+// GET /mcp — SSE stream for server-to-client notifications
 // ---------------------------------------------------------------------------
 app.get('/mcp', async (req, res) => {
   console.log('🔵 MCP GET from:', req.headers['user-agent']);
   const sessionId = req.headers['mcp-session-id'];
 
-  if (!sessionId || !sessions.has(sessionId)) {
+  if (!sessionId || !transports[sessionId]) {
     console.warn(`⚠️  GET with unknown sessionId: ${sessionId}`);
-    return res.status(404).json({ error: 'Session not found. Send POST to /mcp first.' });
+    return res.status(404).json({ error: 'Session not found. Send POST initialize first.' });
   }
 
   console.log(`📡 Opening SSE stream for session: ${sessionId}`);
-  const { transport } = sessions.get(sessionId);
-  await transport.handleRequest(req, res);
+  await transports[sessionId].handleRequest(req, res, req.body);
 });
 
 // ---------------------------------------------------------------------------
-// DELETE /mcp — close a session
+// DELETE /mcp — close session
 // ---------------------------------------------------------------------------
 app.delete('/mcp', async (req, res) => {
   console.log('🔵 MCP DELETE from:', req.headers['user-agent']);
   const sessionId = req.headers['mcp-session-id'];
 
-  if (!sessionId || !sessions.has(sessionId)) {
+  if (!sessionId || !transports[sessionId]) {
     return res.status(404).json({ error: 'Session not found' });
   }
 
-  const { transport } = sessions.get(sessionId);
-  await transport.handleRequest(req, res);
-  sessions.delete(sessionId);
+  await transports[sessionId].handleRequest(req, res, req.body);
+  delete transports[sessionId];
   console.log(`🗑️  Session deleted: ${sessionId}`);
 });
 
