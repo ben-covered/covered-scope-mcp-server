@@ -5,6 +5,9 @@ import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import { z } from 'zod';
+import pg from 'pg';
+
+const { Pool } = pg;
 
 const INGEST_SECRET = process.env.RAILWAY_INGEST_SECRET;
 const PORT = process.env.PORT || 3000;
@@ -17,10 +20,40 @@ if (!INGEST_SECRET) {
   process.exit(1);
 }
 
+if (!process.env.DATABASE_URL) {
+  console.error('❌ Missing DATABASE_URL environment variable');
+  process.exit(1);
+}
+
 // ---------------------------------------------------------------------------
-// In-memory package store
+// Postgres connection pool
 // ---------------------------------------------------------------------------
-const packages = new Map();
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL.includes('railway.internal')
+    ? false
+    : { rejectUnauthorized: false },
+});
+
+// ---------------------------------------------------------------------------
+// Initialize database table
+// ---------------------------------------------------------------------------
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS scope_packages (
+      id TEXT PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      client_name TEXT NOT NULL,
+      address TEXT,
+      damage_type TEXT,
+      date_of_loss TEXT,
+      job_id TEXT,
+      scope_data JSONB NOT NULL,
+      status TEXT NOT NULL DEFAULT 'ready'
+    )
+  `);
+  console.log('✅ Database initialized');
+}
 
 // ---------------------------------------------------------------------------
 // Active transports — keyed by sessionId
@@ -42,19 +75,23 @@ function createMcpServer() {
     { limit: z.number().optional().describe('Maximum number of packages to return') },
     async ({ limit = 20 }) => {
       console.log('✅ list_scope_packages called');
-      const packageList = Array.from(packages.values())
-        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-        .slice(0, limit)
-        .map((pkg) => ({
-          package_id: pkg.id,
-          client_name: pkg.client_name,
-          address: pkg.address,
-          damage_type: pkg.damage_type,
-          date_of_loss: pkg.date_of_loss,
-          job_id: pkg.job_id,
-          created_at: pkg.created_at,
-          status: pkg.status,
-        }));
+      const result = await pool.query(
+        `SELECT id, created_at, client_name, address, damage_type, date_of_loss, job_id, status
+         FROM scope_packages
+         ORDER BY created_at DESC
+         LIMIT $1`,
+        [limit]
+      );
+      const packageList = result.rows.map((row) => ({
+        package_id: row.id,
+        client_name: row.client_name,
+        address: row.address,
+        damage_type: row.damage_type,
+        date_of_loss: row.date_of_loss,
+        job_id: row.job_id,
+        created_at: row.created_at,
+        status: row.status,
+      }));
       console.log(`   📋 Returning ${packageList.length} packages`);
       return { content: [{ type: 'text', text: JSON.stringify(packageList, null, 2) }] };
     }
@@ -67,16 +104,27 @@ function createMcpServer() {
     async ({ query }) => {
       console.log(`✅ get_scope_package called: ${query}`);
       const q = query.toLowerCase();
-      const pkg = q.startsWith('pkg_')
-        ? packages.get(q)
-        : Array.from(packages.values()).find(
-            (p) =>
-              p.client_name.toLowerCase().includes(q) ||
-              (p.job_id && p.job_id.toLowerCase().includes(q))
-          );
-      if (!pkg) {
+      let result;
+
+      if (q.startsWith('pkg_')) {
+        result = await pool.query(
+          'SELECT * FROM scope_packages WHERE id = $1',
+          [q]
+        );
+      } else {
+        result = await pool.query(
+          `SELECT * FROM scope_packages
+           WHERE LOWER(client_name) LIKE $1 OR LOWER(job_id) LIKE $1
+           ORDER BY created_at DESC LIMIT 1`,
+          [`%${q}%`]
+        );
+      }
+
+      if (result.rows.length === 0) {
         return { content: [{ type: 'text', text: `No package found matching "${query}"` }] };
       }
+
+      const pkg = result.rows[0];
       return {
         content: [{
           type: 'text',
@@ -100,23 +148,26 @@ function createMcpServer() {
     {},
     async () => {
       console.log('✅ get_latest_scope called');
-      if (packages.size === 0) {
+      const result = await pool.query(
+        'SELECT * FROM scope_packages ORDER BY created_at DESC LIMIT 1'
+      );
+
+      if (result.rows.length === 0) {
         return { content: [{ type: 'text', text: 'No scope packages available' }] };
       }
-      const latestPkg = Array.from(packages.values()).sort(
-        (a, b) => new Date(b.created_at) - new Date(a.created_at)
-      )[0];
+
+      const pkg = result.rows[0];
       return {
         content: [{
           type: 'text',
           text: JSON.stringify({
             package_metadata: {
-              package_id: latestPkg.id,
-              client_name: latestPkg.client_name,
-              damage_type: latestPkg.damage_type,
-              created_at: latestPkg.created_at,
+              package_id: pkg.id,
+              client_name: pkg.client_name,
+              damage_type: pkg.damage_type,
+              created_at: pkg.created_at,
             },
-            scope_data: latestPkg.scope_data,
+            scope_data: pkg.scope_data,
           }, null, 2),
         }],
       };
@@ -144,46 +195,59 @@ app.use(express.json({ limit: '10mb' }));
 // ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'covered-scope-mcp',
-    packages_count: packages.size,
-    active_sessions: Object.keys(transports).length,
-    authentication: 'none',
-    base_url: BASE_URL,
-  });
+app.get('/health', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT COUNT(*) FROM scope_packages');
+    res.json({
+      status: 'ok',
+      service: 'covered-scope-mcp',
+      packages_count: parseInt(result.rows[0].count),
+      active_sessions: Object.keys(transports).length,
+      authentication: 'none',
+      base_url: BASE_URL,
+      storage: 'postgres',
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
 });
 
 // ---------------------------------------------------------------------------
 // Package ingest
 // ---------------------------------------------------------------------------
-app.post('/packages', (req, res) => {
+app.post('/packages', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || authHeader !== `Bearer ${INGEST_SECRET}`) {
     console.log('❌ Unauthorized package ingest attempt');
     return res.status(401).json({ error: 'Unauthorized' });
   }
+
   const scopeData = req.body;
   if (!scopeData.jobInfo || !scopeData.jobInfo.clientName) {
     console.log('❌ Invalid scope data received');
     return res.status(400).json({ error: 'Invalid scope data: missing jobInfo.clientName' });
   }
+
   const packageId = 'pkg_' + crypto.randomBytes(8).toString('hex');
-  packages.set(packageId, {
-    id: packageId,
-    created_at: new Date().toISOString(),
-    client_name: scopeData.jobInfo.clientName,
-    address: `${scopeData.jobInfo.address || ''}, ${scopeData.jobInfo.city || ''}, ${scopeData.jobInfo.state || ''}`,
-    damage_type: scopeData.jobInfo.damageType || 'unknown',
-    date_of_loss: scopeData.jobInfo.dateOfLoss || null,
-    job_id: scopeData.jobInfo.jobId || null,
-    scope_data: scopeData,
-    status: 'ready',
-  });
+
+  await pool.query(
+    `INSERT INTO scope_packages (id, client_name, address, damage_type, date_of_loss, job_id, scope_data, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'ready')`,
+    [
+      packageId,
+      scopeData.jobInfo.clientName,
+      `${scopeData.jobInfo.address || ''}, ${scopeData.jobInfo.city || ''}, ${scopeData.jobInfo.state || ''}`,
+      scopeData.jobInfo.damageType || 'unknown',
+      scopeData.jobInfo.dateOfLoss || null,
+      scopeData.jobInfo.jobId || null,
+      JSON.stringify(scopeData),
+    ]
+  );
+
   console.log(`📦 Package created: ${packageId} for ${scopeData.jobInfo.clientName}`);
   res.status(201).json({
     success: true,
+    packageId: packageId,
     package_id: packageId,
     client_name: scopeData.jobInfo.clientName,
     damage_type: scopeData.jobInfo.damageType,
@@ -191,22 +255,19 @@ app.post('/packages', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /mcp — client-to-server messages
+// POST /mcp
 // ---------------------------------------------------------------------------
 app.post('/mcp', async (req, res) => {
   console.log('🔵 MCP POST from:', req.headers['user-agent']);
   const sessionId = req.headers['mcp-session-id'];
 
-  // Resume existing session
   if (sessionId && transports[sessionId]) {
     console.log(`📨 Message on existing session: ${sessionId}`);
-    console.log(`   Method: ${req.body?.method || 'unknown'} | Params: ${JSON.stringify(req.body?.params || {}).slice(0, 200)}`);
+    console.log(`   Method: ${req.body?.method || 'unknown'}`);
     await transports[sessionId].handleRequest(req, res, req.body);
-    console.log(`   ✅ handleRequest completed for method: ${req.body?.method}`);
     return;
   }
 
-  // Only allow new sessions on initialize requests
   if (!isInitializeRequest(req.body)) {
     console.warn('⚠️  Non-initialize request with no valid session');
     return res.status(400).json({
@@ -216,7 +277,6 @@ app.post('/mcp', async (req, res) => {
     });
   }
 
-  // New session
   console.log('🆕 New MCP session initializing...');
 
   const transport = new StreamableHTTPServerTransport({
@@ -236,13 +296,11 @@ app.post('/mcp', async (req, res) => {
 
   const server = createMcpServer();
   await server.connect(transport);
-
-  // handleRequest fires onsessioninitialized internally
   await transport.handleRequest(req, res, req.body);
 });
 
 // ---------------------------------------------------------------------------
-// GET /mcp — SSE stream for server-to-client notifications
+// GET /mcp
 // ---------------------------------------------------------------------------
 app.get('/mcp', async (req, res) => {
   console.log('🔵 MCP GET from:', req.headers['user-agent']);
@@ -258,7 +316,7 @@ app.get('/mcp', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// DELETE /mcp — close session
+// DELETE /mcp
 // ---------------------------------------------------------------------------
 app.delete('/mcp', async (req, res) => {
   console.log('🔵 MCP DELETE from:', req.headers['user-agent']);
@@ -276,14 +334,20 @@ app.delete('/mcp', async (req, res) => {
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
-app.listen(PORT, () => {
-  console.log('\n' + '='.repeat(60));
-  console.log('🚀 Covered Scope MCP Server READY');
-  console.log('='.repeat(60));
-  console.log(`📍 Port:        ${PORT}`);
-  console.log(`🌐 Base URL:    ${BASE_URL}`);
-  console.log(`❤️  Health:      ${BASE_URL}/health`);
-  console.log(`🔌 MCP:         ${BASE_URL}/mcp`);
-  console.log(`📦 Packages:    ${BASE_URL}/packages`);
-  console.log('='.repeat(60) + '\n');
+initDb().then(() => {
+  app.listen(PORT, () => {
+    console.log('\n' + '='.repeat(60));
+    console.log('🚀 Covered Scope MCP Server READY');
+    console.log('='.repeat(60));
+    console.log(`📍 Port:        ${PORT}`);
+    console.log(`🌐 Base URL:    ${BASE_URL}`);
+    console.log(`❤️  Health:      ${BASE_URL}/health`);
+    console.log(`🔌 MCP:         ${BASE_URL}/mcp`);
+    console.log(`📦 Packages:    ${BASE_URL}/packages`);
+    console.log(`🗄️  Storage:     PostgreSQL`);
+    console.log('='.repeat(60) + '\n');
+  });
+}).catch((err) => {
+  console.error('❌ Failed to initialize database:', err);
+  process.exit(1);
 });
