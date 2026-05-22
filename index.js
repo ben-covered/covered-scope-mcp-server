@@ -253,48 +253,31 @@ app.post('/packages', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /mcp
+// POST /mcp — stateless: each request gets its own transport + server
 // ---------------------------------------------------------------------------
 app.post('/mcp', async (req, res) => {
   console.log('🔵 MCP POST from:', req.headers['user-agent']);
-  const sessionId = req.headers['mcp-session-id'];
+  console.log(`   Method: ${req.body?.method || 'unknown'}`);
 
-  if (sessionId && transports[sessionId]) {
-    console.log(`📨 Message on existing session: ${sessionId}`);
-    console.log(`   Method: ${req.body?.method || 'unknown'}`);
-    await transports[sessionId].handleRequest(req, res, req.body);
-    return;
-  }
-
-  if (!isInitializeRequest(req.body)) {
-    console.warn('⚠️  Non-initialize request with no valid session');
-    return res.status(400).json({
-      jsonrpc: '2.0',
-      error: { code: -32000, message: 'No valid session. Send initialize request first.' },
-      id: null,
+  try {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined, // stateless — no session management
     });
-  }
 
-  console.log('🆕 New MCP session initializing...');
+    const server = createMcpServer();
 
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => crypto.randomUUID(),
-    onsessioninitialized: (newSessionId) => {
-      transports[newSessionId] = transport;
-      console.log(`✅ Session initialized: ${newSessionId}`);
-    },
-  });
+    res.on('close', () => {
+      transport.close();
+    });
 
-  transport.onclose = () => {
-    if (transport.sessionId) {
-      delete transports[transport.sessionId];
-      console.log(`🔴 Session closed: ${transport.sessionId}`);
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error('❌ MCP POST error:', err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null });
     }
-  };
-
-  const server = createMcpServer();
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
+  }
 });
 
 // ---------------------------------------------------------------------------
